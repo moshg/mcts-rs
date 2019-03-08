@@ -268,6 +268,11 @@ impl<G: Game> Mct<G> {
 
     pub fn next(&mut self, action: G::Action) {
         use std::mem;
+
+        if self.children.is_empty() {
+            panic!("game finished");
+        }
+
         let mut node = None;
         let mut children = Vec::new();
         mem::swap(&mut children, &mut self.children);
@@ -284,7 +289,7 @@ impl<G: Game> Mct<G> {
         self.children = match node.children {
             Children::NotExpanded => panic!("unreachable"),
             Children::Expanded(v) => v,
-            Children::PlayerWin(b) => panic!("game finished")
+            Children::PlayerWin(b) => Vec::new()
         };
         self.game = node.game;
     }
