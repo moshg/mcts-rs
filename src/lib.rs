@@ -2,8 +2,6 @@ use core::fmt::Write;
 use std::f32;
 use std::fmt;
 
-type UInt = ::std::os::raw::c_uint;
-
 pub trait Game where Self: Sized {
     /// The type of the actions.
     type Action: Eq;
@@ -22,12 +20,8 @@ pub trait Game where Self: Sized {
 
     /// Returns the priority to visit for MCTS.
     #[inline]
-    fn priority(&self, win: UInt, visits: UInt, parent_visits: UInt) -> f32 {
-        if visits == 0 {
-            f32::INFINITY
-        } else {
-            win as f32 / visits as f32 + (2.0 * (parent_visits as f32).ln() / visits as f32).sqrt()
-        }
+    fn bias_const(&self) -> f32 {
+        2.0f32.sqrt()
     }
 }
 
@@ -54,11 +48,106 @@ impl fmt::Display for Status {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(PartialEq, Clone, Default)]
+struct Node<G: Game> {
+    game: G,
+    prev_act: G::Action,
+    visits: f32,
+    wins: f32,
+    children: Children<G>,
+}
+
+impl<G: Game> Node<G> {
+    #[inline]
+    fn new(game: G, prev_act: G::Action) -> Node<G> {
+        Node { game, prev_act, wins: 0.0, visits: 0.0, children: Children::NotExpanded }
+    }
+
+    #[inline]
+    fn leaf(game: G, prev_act: G::Action, win: f32) -> Node<G> {
+        Node { game, prev_act, wins: 0.0, visits: 0.0, children: Children::Leaf(win) }
+    }
+
+    #[inline]
+    fn priority(&self, parent_visits: f32) -> f32 {
+        if self.visits == 0.0 {
+            f32::INFINITY
+        } else {
+            self.wins / self.visits + self.game.bias_const() * (parent_visits.ln() / self.visits).sqrt()
+        }
+    }
+
+    fn play_out(&mut self) -> f32 {
+        self.visits += 1.0;
+        self.children.expand(&self.game);
+
+        let win: f32;
+        match &mut self.children {
+            &mut Children::NotExpanded => { panic!("unreachable") }
+            &mut Children::Leaf(w) => win = w,
+            &mut Children::Expanded(ref mut children) => {
+                let (mut prior_child, children) = children.split_first_mut().unwrap();
+                let mut max_priority = prior_child.priority(self.visits);
+                if max_priority == f32::INFINITY {
+                    win = 1.0 - prior_child.play_out();
+                } else {
+                    for child in children {
+                        let priority = child.priority(self.visits);
+                        if priority == f32::INFINITY {
+                            // Need not write max_priority because it is not used after for loop.
+                            prior_child = child;
+                            break;
+                        }
+
+                        if priority > max_priority {
+                            max_priority = priority;
+                            prior_child = child;
+                        }
+                    }
+
+                    win = 1.0 - prior_child.play_out();
+                }
+            }
+        }
+
+        self.wins += win;
+        win
+    }
+
+    fn next(self, act: G::Action) -> Node<G> {
+        match self.children {
+            Children::NotExpanded => Node::new(self.game.next(&act), act),
+            Children::Leaf(win) => panic!("game finished"),
+            Children::Expanded(children) => {
+                let mut node = None;
+                for child in children {
+                    if child.prev_act == act {
+                        node = Some(child);
+                    }
+                }
+                node.expect("action must contained in the return of Game::next_actions()")
+            }
+        }
+    }
+}
+
+impl<G: Game> fmt::Debug for Node<G> where G: fmt::Debug, G::Action: fmt::Debug {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("prev_action", &self.prev_act)
+            .field("visits", &self.visits)
+            .field("wins", &self.wins)
+            .field("game", &self.game)
+            .field("children", &self.children)
+            .finish()
+    }
+}
+
+#[derive(PartialEq)]
 enum Children<G: Game> {
     NotExpanded,
     Expanded(Vec<Node<G>>),
-    PlayerWin(bool),
+    Leaf(f32),
 }
 
 impl<G: Game> Children<G> {
@@ -71,18 +160,20 @@ impl<G: Game> Children<G> {
     }
 
     #[inline]
-    fn expand(&mut self, game: &G, is_current_player: bool) where G: Game {
+    fn expand(&mut self, game: &G) where G: Game {
         if self.has_expanded() {
             return;
         }
 
         *self = match game.status() {
-            Status::Win => Children::PlayerWin(is_current_player),
-            Status::Draw => Children::PlayerWin(false),
-            Status::Lose => Children::PlayerWin(!is_current_player),
+            // Current player of `game` has been changed when `game.next()` called.
+            // So player who do previous action is different from current player.
+            Status::Win => Children::Leaf(0.0),
+            Status::Draw => Children::Leaf(0.5),
+            Status::Lose => Children::Leaf(1.0),
             Status::Unfinished => Children::Expanded({
                 let mut actions = game.next_actions();
-                actions.into_iter().map(|a| Node::new(game.next(&a), !is_current_player, a)).collect()
+                actions.into_iter().map(|a| Node::new(game.next(&a), a)).collect()
             })
         }
     }
@@ -90,11 +181,11 @@ impl<G: Game> Children<G> {
 
 impl<G: Game> Clone for Children<G> where G: Clone, G::Action: Clone {
     #[inline]
-    fn clone(&self) -> Self {
+    fn clone(&self) -> Children<G> {
         match self {
             &Children::NotExpanded => Children::NotExpanded,
             &Children::Expanded(ref v) => Children::Expanded(v.clone()),
-            &Children::PlayerWin(b) => Children::PlayerWin(b)
+            &Children::Leaf(b) => Children::Leaf(b)
         }
     }
 }
@@ -111,136 +202,48 @@ impl<G: Game> fmt::Debug for Children<G> where G: fmt::Debug, G::Action: fmt::De
         match self {
             &Children::NotExpanded => f.write_str("NotExpanded"),
             &Children::Expanded(ref v) => {
-                f.write_str("Expanded(")?;
-                fmt::Debug::fmt(v, f)?;
-                f.write_char(')')
+                f.debug_tuple("Expanded")
+                    .field(v)
+                    .finish()
             }
-            &Children::PlayerWin(b) => {
-                f.write_str("PlayerWin(")?;
-                fmt::Debug::fmt(&b, f)?;
-                f.write_char(')')
+            &Children::Leaf(ref b) => {
+                f.debug_tuple("Leaf")
+                    .field(b)
+                    .finish()
             }
         }
     }
 }
 
-#[derive(Eq, PartialEq, Clone, Default, Debug)]
-struct Node<G: Game> {
+/// Upper confidence bound 1 applied to Tree Search.
+#[derive(PartialEq, Default)]
+pub struct Uct<G: Game> {
     game: G,
-    is_curr_player: bool,
-    prev_act: G::Action,
-    wins: UInt,
-    visits: UInt,
-    children: Children<G>,
-}
-
-impl<G: Game> Node<G> {
-    #[inline]
-    fn new(game: G, is_curr_player: bool, prev_act: G::Action) -> Node<G> {
-        Node { game, is_curr_player, prev_act, wins: 0, visits: 0, children: Children::NotExpanded }
-    }
-
-    #[inline]
-    fn leaf(game: G, is_curr_player: bool, prev_act: G::Action, has_player_win: bool) -> Node<G> {
-        Node { game, is_curr_player, prev_act, wins: 0, visits: 0, children: Children::PlayerWin(has_player_win) }
-    }
-
-    #[inline]
-    fn priority(&self, parent_visits: UInt) -> f32 {
-        self.game.priority(self.wins, self.visits, parent_visits)
-    }
-
-    fn play_out(&mut self) -> bool {
-        self.visits += 1;
-        self.children.expand(&self.game, self.is_curr_player);
-
-        let has_player_win: bool;
-        match &mut self.children {
-            &mut Children::NotExpanded => { panic!("unreachable") }
-            &mut Children::PlayerWin(win) => has_player_win = win,
-            &mut Children::Expanded(ref mut children) => {
-                let (mut prior_child, children) = children.split_first_mut().unwrap();
-                let mut max_priority = prior_child.priority(self.visits);
-                if max_priority == f32::INFINITY {
-                    has_player_win = prior_child.play_out();
-                } else {
-                    for child in children {
-                        let priority = child.priority(self.visits);
-                        if priority == f32::INFINITY {
-                            // Need not write max_priority because it is not used after for loop.
-                            prior_child = child;
-                            break;
-                        }
-
-                        if priority > max_priority {
-                            max_priority = priority;
-                            prior_child = child;
-                        }
-                    }
-
-                    has_player_win = prior_child.play_out();
-                }
-            }
-        }
-
-        if has_player_win {
-            self.wins += 1
-        }
-        has_player_win
-    }
-
-    fn next(self, act: G::Action) -> Node<G> {
-        match self.children {
-            Children::NotExpanded => Node::new(self.game.next(&act), !self.is_curr_player, act),
-            Children::PlayerWin(win) => panic!("game finished"),
-            Children::Expanded(children) => {
-                let mut node = None;
-                for child in children {
-                    if child.prev_act == act {
-                        node = Some(child);
-                    }
-                }
-                node.expect("action must contained in the return of Game::next_actions()")
-            }
-        }
-    }
-}
-
-#[derive(Eq, PartialEq, Default)]
-pub struct Mct<G: Game> {
-    game: G,
-    is_curr_player: bool,
-    visits: UInt,
+    visits: f32,
     children: Vec<Node<G>>,
 }
 
-impl<G: Game> Mct<G> {
+impl<G: Game> Uct<G> {
     #[inline]
-    pub fn new(game: G, is_current_player: bool) -> Mct<G> {
-        Mct {
-            children: game.next_actions().into_iter().map(|a| Node::new(game.next(&a), !is_current_player, a)).collect(),
+    pub fn new(game: G, is_current_player: bool) -> Uct<G> {
+        Uct {
+            children: game.next_actions().into_iter().map(|a| Node::new(game.next(&a), a)).collect(),
             game,
-            is_curr_player: is_current_player,
-            visits: 0,
+            visits: 0.0,
         }
     }
 
     /// Returns the number of times this node is visited.
     #[inline]
-    pub fn visits(&self) -> UInt {
-        self.visits
-    }
-
-    #[inline]
-    pub fn is_current_player(&self) -> bool {
-        self.is_curr_player
+    pub fn visits(&self) -> u32 {
+        self.visits as u32
     }
 }
 
-impl<G: Game> Mct<G> {
+impl<G: Game> Uct<G> {
     #[inline]
     pub fn play_out(&mut self) {
-        self.visits += 1;
+        self.visits += 1.0;
 
         if let Some((mut prior_child, children)) = self.children.split_first_mut() {
             let mut max_priority = prior_child.priority(self.visits);
@@ -283,38 +286,37 @@ impl<G: Game> Mct<G> {
         }
         let mut node = node.expect("action must contained in the return of Game::next_actions()");
 
-        self.is_curr_player = !self.is_curr_player;
         self.visits = node.visits;
-        node.children.expand(&node.game, node.is_curr_player);
+        node.children.expand(&node.game);
         self.children = match node.children {
             Children::NotExpanded => panic!("unreachable"),
             Children::Expanded(v) => v,
-            Children::PlayerWin(b) => Vec::new()
+            Children::Leaf(b) => Vec::new()
         };
         self.game = node.game;
     }
 
     #[inline]
-    pub fn best_action(&self) -> &G::Action {
+    pub fn most_visited(&self) -> &G::Action {
         let (mut best_child, children) = self.children.split_first().expect("game finished");
-        let mut max_win_rate = if best_child.visits == 0 {
-            // not visited, not good
-            0.0
-        } else {
-            best_child.wins as f32 / best_child.visits as f32
-        };
+        let mut max_visits = best_child.visits;
         for child in children {
-            if child.visits == 0 {
-                continue;
-            }
-
-            let win_rate: f32 = child.wins as f32 / child.visits as f32;
-            if win_rate > max_win_rate {
+            if child.visits > max_visits {
                 best_child = child;
-                max_win_rate = win_rate;
+                max_visits = child.visits;
             }
         }
 
         &best_child.prev_act
+    }
+}
+
+impl<G: Game> fmt::Debug for Uct<G> where G: fmt::Debug, G::Action: fmt::Debug {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Uct")
+            .field("game", &self.game)
+            .field("visits", &self.visits)
+            .field("children", &self.children)
+            .finish()
     }
 }
