@@ -8,7 +8,7 @@ use std::ops::Range;
 use rand;
 use rand::Rng;
 
-use mcts::{Game, Mct, Status};
+use mcts::{Game, Status, Uct};
 
 /// The type of bit board.
 pub type Board = u16;
@@ -16,20 +16,28 @@ pub type Board = u16;
 /// The type of positions where i, j is represented by i * j
 pub type Pos = u8;
 
-/// The array of position in a goodness order.
-const POS_ARRAY: [Pos; 9] = [4, 0, 2, 6, 8, 1, 3, 5, 7];
-
 /// Lines in board.
 const LINES: [Board; 8] = [
-    0b111, 0b111_000, 0b111_000_000, 0b001_001_001, 0b010_010_010, 0b100_100_100,
-    0b001_010_100, 0b100_010_001
+    0b111, 0b111_000, 0b111_000_000,  // horizontal
+    0b001_001_001, 0b010_010_010, 0b100_100_100,  // vertical
+    0b001_010_100, 0b100_010_001  // orthogonal
 ];
 
-#[derive(Eq, PartialEq, Copy, Clone, Hash, Debug)]
+#[derive(Eq, PartialEq, Copy, Clone, Hash)]
 pub struct TicTacToe {
     current: Board,
     next: Board,
     is_current_first: bool,
+}
+
+impl fmt::Debug for TicTacToe {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("TicTacToe")
+            .field("current", &format_args!("{:09b}", self.current))
+            .field("next", &format_args!("{:09b}", self.next))
+            .field("is_current_first", &self.is_current_first)
+            .finish()
+    }
 }
 
 impl TicTacToe {
@@ -123,23 +131,21 @@ impl fmt::Display for TicTacToe {
 
 fn main() {
     let mut game = TicTacToe::new();
-    let mut mct = Mct::new(game, true);
+    let mut mct = Uct::new(game, true);
 
     loop {
-        let action = if mct.is_current_player() {
-            for i in 0..1000 {
-                mct.play_out()
+        let action = if game.is_current_first {
+            for i in 0..100 {
+                mct.play_out();
             }
-            *mct.best_action()
+            *mct.most_visited()
         } else {
             use std::i16;
             let p = random_best_play(game);
-            eprintln!("{}", p);
             p
         };
         game = game.played_at(action);
         mct.next(action);
-
         println!("{}", game);
 
         match game.status() {
@@ -157,7 +163,7 @@ fn alpha_beta(game: TicTacToe, alpha: i16, beta: i16) -> i16 {
         if TicTacToe::is_aligned(game.next) { return -(1 << depth); }
         if game.is_full() { return 0; }
         let mut alpha = alpha;
-        for &pos in &POS_ARRAY {
+        for pos in 0..9 {
             if !game.can_play_at(pos) { continue; }
             let next_alpha = -alpha_beta_with_depth(game.played_at(pos), -beta, -alpha, depth + 1);
             alpha = next_alpha.max(alpha);
@@ -170,15 +176,17 @@ fn alpha_beta(game: TicTacToe, alpha: i16, beta: i16) -> i16 {
 }
 
 
+// Because of evaluation function, even when can win on next turn, will not play at winning position.
 /// Returns best action randomly.
 pub fn random_best_play(game: TicTacToe) -> Pos {
-    // 相手の評価を最小化する.
+    // minimize opponent's value
     use std::i16;
 
-    let playable = POS_ARRAY.iter().filter(|&&pos| game.can_play_at(pos));
     let mut min_pos = Vec::new();
     let mut min_val = i16::MAX - 1;
-    for &pos in playable {
+    for pos in 0..9 {
+        if !game.can_play_at(pos) { continue; }
+
         let val = alpha_beta(game.played_at(pos), -(i16::MAX - 1), min_val + 1);
         if val == min_val {
             min_pos.push(pos);
